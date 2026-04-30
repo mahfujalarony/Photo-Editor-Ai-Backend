@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+rembg[cpu]
+pillow
+python-multipart
+a2wsgi
+gunicorn
