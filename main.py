@@ -1,13 +1,31 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from PIL import Image
+from PIL import Image, ImageOps
+import base64
+import os
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
 import io
 import re
 
 app = FastAPI()
 
+load_dotenv()
+
+def get_openai_client() -> AsyncOpenAI:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY is not set on the server.",
+        )
+
+    return AsyncOpenAI(api_key=api_key)
 MAX_FILE_SIZE = 10 * 1024 * 1024
+MAX_IMAGE_DIMENSION = 8000
+MAX_OCR_DIMENSION = 1600
+OCR_JPEG_QUALITY = 70
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
 HEX_COLOR_PATTERN = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -47,6 +65,50 @@ def remove_image_background(input_bytes: bytes) -> bytes:
     from rembg import remove
 
     return remove(input_bytes)
+
+
+def open_image(input_bytes: bytes) -> Image.Image:
+    try:
+        image = Image.open(io.BytesIO(input_bytes))
+        return ImageOps.exif_transpose(image)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Could not read this image.") from exc
+
+
+def image_to_jpeg_stream(image: Image.Image, quality: int = 95) -> io.BytesIO:
+    if image.mode in {"RGBA", "LA"}:
+        alpha = image.getchannel("A")
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        background.paste(image.convert("RGBA"), mask=alpha)
+        final = background
+    else:
+        final = image.convert("RGB")
+
+    output = io.BytesIO()
+    final.save(output, format="JPEG", quality=quality, optimize=True)
+    output.seek(0)
+    return output
+
+
+def optimize_image_for_ocr(input_bytes: bytes) -> tuple[bytes, str]:
+    image = open_image(input_bytes)
+    max_dim = max(image.width, image.height)
+
+    if max_dim > MAX_OCR_DIMENSION:
+        scale = MAX_OCR_DIMENSION / max_dim
+        new_size = (
+            max(1, int(image.width * scale)),
+            max(1, int(image.height * scale)),
+        )
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
+
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=OCR_JPEG_QUALITY, optimize=True)
+    output.seek(0)
+    return output.read(), "image/jpeg"
 
 
 @app.post("/remove-background")
@@ -104,3 +166,126 @@ async def apply_color_background(
         media_type=media_type,
         headers={"Content-Disposition": f"attachment; filename=background.{extension}"},
     )
+
+
+@app.post("/resize-image")
+async def resize_image(
+    file: UploadFile = File(...),
+    width: int = Form(...),
+    height: int = Form(...),
+):
+    if width < 1 or height < 1:
+        raise HTTPException(status_code=400, detail="Width and height must be positive.")
+
+    if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Width and height must be {MAX_IMAGE_DIMENSION}px or smaller.",
+        )
+
+    input_bytes = await read_valid_image(file)
+    image = open_image(input_bytes)
+    resized = image.resize((width, height), Image.Resampling.LANCZOS)
+    output = image_to_jpeg_stream(resized, quality=95)
+
+    return StreamingResponse(
+        output,
+        media_type="image/jpeg",
+        headers={"Content-Disposition": f"attachment; filename=resized-{width}x{height}.jpg"},
+    )
+
+
+@app.post("/compress-image")
+async def compress_image(
+    file: UploadFile = File(...),
+    target_kb: int = Form(...) 
+):
+    if target_kb < 1:
+        raise HTTPException(status_code=400, detail="Target size must be at least 1KB.")
+
+    if target_kb > MAX_FILE_SIZE // 1024:
+        raise HTTPException(status_code=400, detail="Target size must be 10MB or smaller.")
+
+    input_bytes = await read_valid_image(file)
+    target_bytes = target_kb * 1024
+
+    if len(input_bytes) <= target_bytes:
+        extension = "jpg"
+        media_type = file.content_type or "image/jpeg"
+
+        if media_type == "image/png":
+            extension = "png"
+        elif media_type == "image/webp":
+            extension = "webp"
+
+        return StreamingResponse(
+            io.BytesIO(input_bytes),
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename=under-{target_kb}kb.{extension}"},
+        )
+
+    img = open_image(input_bytes).convert("RGB")
+    quality = 95
+    
+    output = io.BytesIO()
+    
+    while True:
+        output.seek(0)
+        output.truncate(0)
+        
+        img.save(output, format="JPEG", quality=quality, optimize=True)
+        size = output.tell()
+        
+        if size <= target_bytes or quality <= 10:
+            break
+            
+        quality -= 5
+
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type="image/jpeg",
+        headers={"Content-Disposition": f"attachment; filename=compressed-{target_kb}kb.jpg"},
+    )
+
+
+@app.post("/extract-text")
+async def extract_text_with_openai(file: UploadFile = File(...)):
+    input_bytes = await read_valid_image(file)
+    optimized_bytes, mime_type = optimize_image_for_ocr(input_bytes)
+
+    base64_image = base64.b64encode(optimized_bytes).decode("utf-8")
+    client = get_openai_client()
+    
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Extract all the text from this image. Return ONLY the extracted text. Maintain the original formatting, paragraphs, and language perfectly. If there is no text, reply with 'NO_TEXT_FOUND'.",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{base64_image}",
+                            },
+                        },
+                    ],
+                },
+            ],
+            max_tokens=1500,
+        )
+
+        extracted_text = response.choices[0].message.content.strip()
+
+        if extracted_text == "NO_TEXT_FOUND":
+            return {"success": False, "text": ""}
+
+        return {"success": True, "text": extracted_text}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}

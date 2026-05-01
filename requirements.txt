@@ -5,3 +5,5 @@ pillow
 python-multipart
 a2wsgi
 gunicorn
+openai
+python-dotenv
