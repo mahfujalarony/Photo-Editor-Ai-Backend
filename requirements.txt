@@ -1,10 +1,10 @@
 fastapi
 uvicorn[standard]
-rembg==2.0.69
+rembg
 onnxruntime
-pillow==9.5.0
-numpy==1.26.4
-scikit-image==0.24.0
+pillow
+numpy
+scikit-image
 simple-lama-inpainting
 python-multipart
 a2wsgi
