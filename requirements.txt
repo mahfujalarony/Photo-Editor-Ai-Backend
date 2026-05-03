@@ -1,7 +1,9 @@
 fastapi
 uvicorn[standard]
 rembg[cpu]
-pillow
+pillow<10.0.0
+numpy<2.0.0
+simple-lama-inpainting
 python-multipart
 a2wsgi
 gunicorn
