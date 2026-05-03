@@ -22,6 +22,7 @@ def get_openai_client() -> AsyncOpenAI:
         )
 
     return AsyncOpenAI(api_key=api_key)
+
 MAX_FILE_SIZE = 10 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 8000
 MAX_OCR_DIMENSION = 1600
@@ -42,6 +43,76 @@ app.add_middleware(
 def home():
     return {"message": "AI Image Backend Running"}
 
+@app.post("/magic-eraser")
+async def magic_eraser(
+    image: UploadFile = File(...),
+    mask: UploadFile = File(...)
+):
+    input_image_bytes = await read_valid_image(image)
+    mask_bytes = await read_valid_image(mask)
+
+    from simple_lama_inpainting import SimpleLama
+
+    img = Image.open(io.BytesIO(input_image_bytes)).convert("RGB")
+    mask_img = Image.open(io.BytesIO(mask_bytes)).convert("L")
+
+    # Important: The mask might have grey pixels from scaling/brushing.
+    # Convert mask strictly to binary (0 and 255) as LAMA expects a hard mask
+    mask_img = mask_img.point(lambda p: 255 if p > 10 else 0)
+
+    if img.size != mask_img.size:
+        mask_img = mask_img.resize(img.size, Image.Resampling.NEAREST)
+
+    orig_w, orig_h = img.size
+    max_dim = max(orig_w, orig_h)
+    
+    # Let's increase limit to 2048 to retain high detail
+    if max_dim > 2048:
+        scale_factor = 2048.0 / max_dim
+        new_w = max(1, int(orig_w * scale_factor))
+        new_h = max(1, int(orig_h * scale_factor))
+        
+        # Round up to nearest multiple of 8, LAMA often expects dimensions divisible by 8 or 16
+        new_w = new_w - (new_w % 8)
+        new_h = new_h - (new_h % 8)
+
+        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        mask_img = mask_img.resize((new_w, new_h), Image.Resampling.NEAREST)
+
+    # Ensure mask has the exact same size as the image before entering LAMA
+    if mask_img.size != img.size:
+        mask_img = mask_img.resize(img.size, Image.Resampling.NEAREST)
+
+    try:
+        from simple_lama_inpainting import SimpleLama
+
+        simple_lama = SimpleLama()
+        
+        # Dilate mask slightly to cover object edges better 
+        import numpy as np
+        import cv2
+        mask_np = np.array(mask_img)
+        kernel = np.ones((5, 5), np.uint8)
+        mask_np = cv2.dilate(mask_np, kernel, iterations=2)
+        mask_img = Image.fromarray(mask_np)
+
+        result = simple_lama(img, mask_img)
+        
+        if max_dim > 2048:
+            result = result.resize((orig_w, orig_h), Image.Resampling.LANCZOS)
+
+        output = io.BytesIO()
+        result.save(output, format="JPEG", quality=95)
+        output.seek(0)
+        
+        return StreamingResponse(
+            output,
+            media_type="image/jpeg",
+            headers={"Content-Disposition": "attachment; filename=erased.jpg"},
+        )
+    except Exception as e:
+        print(f"LAMA Image Edit failed: {e}")
+        raise HTTPException(status_code=500, detail=f"LAMA processing failed: {str(e)}")
 
 async def read_valid_image(file: UploadFile) -> bytes:
     if file.content_type not in ALLOWED_TYPES:
