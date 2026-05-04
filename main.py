@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.concurrency import run_in_threadpool
 from PIL import Image, ImageOps
 import base64
 import os
@@ -8,10 +9,19 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 import io
 import re
+import numpy as np
+import cv2
+from simple_lama_inpainting import SimpleLama
+import rembg
 
 app = FastAPI()
 
 load_dotenv()
+
+print("Initializing AI models (this might take a few seconds)...")
+simple_lama_model = SimpleLama()
+rembg_session = rembg.new_session()
+print("AI models loaded successfully!")
 
 def get_openai_client() -> AsyncOpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -43,16 +53,7 @@ app.add_middleware(
 def home():
     return {"message": "AI Image Backend Running"}
 
-@app.post("/magic-eraser")
-async def magic_eraser(
-    image: UploadFile = File(...),
-    mask: UploadFile = File(...)
-):
-    input_image_bytes = await read_valid_image(image)
-    mask_bytes = await read_valid_image(mask)
-
-    from simple_lama_inpainting import SimpleLama
-
+def process_lama(input_image_bytes: bytes, mask_bytes: bytes) -> bytes:
     img = Image.open(io.BytesIO(input_image_bytes)).convert("RGB")
     mask_img = Image.open(io.BytesIO(mask_bytes)).convert("L")
 
@@ -66,9 +67,9 @@ async def magic_eraser(
     orig_w, orig_h = img.size
     max_dim = max(orig_w, orig_h)
     
-    # Let's increase limit to 2048 to retain high detail
-    if max_dim > 2048:
-        scale_factor = 2048.0 / max_dim
+    # Scale down to 1024 for faster processing
+    if max_dim > 1024:
+        scale_factor = 1024.0 / max_dim
         new_w = max(1, int(orig_w * scale_factor))
         new_h = max(1, int(orig_h * scale_factor))
         
@@ -83,30 +84,36 @@ async def magic_eraser(
     if mask_img.size != img.size:
         mask_img = mask_img.resize(img.size, Image.Resampling.NEAREST)
 
+    # Dilate mask slightly to cover object edges better 
+    mask_np = np.array(mask_img)
+    kernel = np.ones((5, 5), np.uint8)
+    mask_np = cv2.dilate(mask_np, kernel, iterations=2)
+    mask_img = Image.fromarray(mask_np)
+
+    result = simple_lama_model(img, mask_img)
+    
+    if max_dim > 1024:
+        result = result.resize((orig_w, orig_h), Image.Resampling.LANCZOS)
+
+    output = io.BytesIO()
+    result.save(output, format="JPEG", quality=95)
+    output.seek(0)
+    return output.read()
+
+@app.post("/magic-eraser")
+async def magic_eraser(
+    image: UploadFile = File(...),
+    mask: UploadFile = File(...)
+):
+    input_image_bytes = await read_valid_image(image)
+    mask_bytes = await read_valid_image(mask)
+
     try:
-        from simple_lama_inpainting import SimpleLama
-
-        simple_lama = SimpleLama()
-        
-        # Dilate mask slightly to cover object edges better 
-        import numpy as np
-        import cv2
-        mask_np = np.array(mask_img)
-        kernel = np.ones((5, 5), np.uint8)
-        mask_np = cv2.dilate(mask_np, kernel, iterations=2)
-        mask_img = Image.fromarray(mask_np)
-
-        result = simple_lama(img, mask_img)
-        
-        if max_dim > 2048:
-            result = result.resize((orig_w, orig_h), Image.Resampling.LANCZOS)
-
-        output = io.BytesIO()
-        result.save(output, format="JPEG", quality=95)
-        output.seek(0)
+        # Run CPU-heavy LAMA process in threadpool to avoid blocking main event loop
+        output_bytes = await run_in_threadpool(process_lama, input_image_bytes, mask_bytes)
         
         return StreamingResponse(
-            output,
+            io.BytesIO(output_bytes),
             media_type="image/jpeg",
             headers={"Content-Disposition": "attachment; filename=erased.jpg"},
         )
@@ -133,10 +140,7 @@ async def read_valid_image(file: UploadFile) -> bytes:
 
 
 def remove_image_background(input_bytes: bytes) -> bytes:
-    from rembg import remove
-
-    return remove(input_bytes)
-
+    return rembg.remove(input_bytes, session=rembg_session)
 
 def open_image(input_bytes: bytes) -> Image.Image:
     try:
@@ -185,7 +189,7 @@ def optimize_image_for_ocr(input_bytes: bytes) -> tuple[bytes, str]:
 @app.post("/remove-background")
 async def remove_background(file: UploadFile = File(...)):
     input_bytes = await read_valid_image(file)
-    output_bytes = remove_image_background(input_bytes)
+    output_bytes = await run_in_threadpool(remove_image_background, input_bytes)
 
     return StreamingResponse(
         io.BytesIO(output_bytes),
@@ -207,33 +211,37 @@ async def apply_color_background(
         )
 
     input_bytes = await read_valid_image(file)
-    subject_bytes = remove_image_background(input_bytes)
-    subject = Image.open(io.BytesIO(subject_bytes)).convert("RGBA")
+    
+    def process_apply_color(in_bytes: bytes):
+        subject_bytes = remove_image_background(in_bytes)
+        subject = Image.open(io.BytesIO(subject_bytes)).convert("RGBA")
 
-    bg_color = color.lstrip("#")
-    r, g, b = tuple(int(bg_color[i:i+2], 16) for i in (0, 2, 4))
+        bg_color = color.lstrip("#")
+        r, g, b = tuple(int(bg_color[i:i+2], 16) for i in (0, 2, 4))
 
-    background = Image.new("RGBA", subject.size, (r, g, b, 255))
-    final = Image.alpha_composite(background, subject)
+        background = Image.new("RGBA", subject.size, (r, g, b, 255))
+        final = Image.alpha_composite(background, subject)
 
-    output = io.BytesIO()
+        output = io.BytesIO()
 
-    if format == "jpg" or format == "jpeg":
-        final.convert("RGB").save(output, format="JPEG", quality=95)
-        media_type = "image/jpeg"
-    elif format == "webp":
-        final.save(output, format="WEBP", quality=95)
-        media_type = "image/webp"
-    else:
-        final.save(output, format="PNG")
-        media_type = "image/png"
+        if format == "jpg" or format == "jpeg":
+            final.convert("RGB").save(output, format="JPEG", quality=95)
+            media_type = "image/jpeg"
+        elif format == "webp":
+            final.save(output, format="WEBP", quality=95)
+            media_type = "image/webp"
+        else:
+            final.save(output, format="PNG")
+            media_type = "image/png"
 
-    output.seek(0)
+        output.seek(0)
+        extension = "jpg" if format in {"jpg", "jpeg"} else format
+        return output.read(), media_type, extension
 
-    extension = "jpg" if format in {"jpg", "jpeg"} else format
+    output_bytes, media_type, extension = await run_in_threadpool(process_apply_color, input_bytes)
 
     return StreamingResponse(
-        output,
+        io.BytesIO(output_bytes),
         media_type=media_type,
         headers={"Content-Disposition": f"attachment; filename=background.{extension}"},
     )
