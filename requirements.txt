@@ -5,7 +5,7 @@ onnxruntime
 pillow
 numpy
 scikit-image
-simple-lama-inpainting
+torch
 python-multipart
 a2wsgi
 gunicorn

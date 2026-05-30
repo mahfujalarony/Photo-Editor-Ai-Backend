@@ -22,6 +22,77 @@ simple_lama_lock = Lock()
 rembg_session = None
 rembg_lock = Lock()
 
+LAMA_MODEL_URL = os.getenv(
+    "LAMA_MODEL_URL",
+    "https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt",
+)
+
+
+def get_lama_model_path():
+    model_path = os.getenv("LAMA_MODEL")
+
+    if model_path:
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"LAMA model not found: {model_path}")
+
+        return model_path
+
+    from torch.hub import download_url_to_file, get_dir
+    from urllib.parse import urlparse
+
+    model_dir = os.path.join(get_dir(), "checkpoints")
+    os.makedirs(model_dir, exist_ok=True)
+    filename = os.path.basename(urlparse(LAMA_MODEL_URL).path)
+    cached_file = os.path.join(model_dir, filename)
+
+    if not os.path.exists(cached_file):
+        download_url_to_file(LAMA_MODEL_URL, cached_file, hash_prefix=None, progress=True)
+
+    return cached_file
+
+
+class LamaModel:
+    def __init__(self):
+        import torch
+
+        self.device = torch.device("cpu")
+        self.model = torch.jit.load(get_lama_model_path(), map_location=self.device)
+        self.model.eval()
+        self.model.to(self.device)
+
+    def __call__(self, image: Image.Image, mask: Image.Image) -> Image.Image:
+        import torch
+        import numpy as np
+
+        image_np = np_image_to_tensor_array(image.convert("RGB"))
+        mask_np = np_image_to_tensor_array(mask.convert("L"))
+
+        image_tensor = torch.from_numpy(image_np).unsqueeze(0).to(self.device)
+        mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).to(self.device)
+        mask_tensor = (mask_tensor > 0) * 1
+
+        with torch.inference_mode():
+            inpainted = self.model(image_tensor, mask_tensor)
+
+        result_np = inpainted[0].permute(1, 2, 0).detach().cpu().numpy()
+        result_np = np.clip(result_np * 255, 0, 255).astype("uint8")
+        return Image.fromarray(result_np)
+
+
+def np_image_to_tensor_array(image: Image.Image):
+    import numpy as np
+
+    image_np = np.array(image)
+
+    if image_np.ndim == 3:
+        image_np = np.transpose(image_np, (2, 0, 1))
+    elif image_np.ndim == 2:
+        image_np = image_np[np.newaxis, ...]
+    else:
+        raise ValueError("Unsupported image dimensions.")
+
+    return image_np.astype("float32") / 255
+
 
 def get_simple_lama_model():
     global simple_lama_model
@@ -30,21 +101,7 @@ def get_simple_lama_model():
         with simple_lama_lock:
             if simple_lama_model is None:
                 print("Loading LAMA model...")
-                import torch
-                from simple_lama_inpainting import SimpleLama
-
-                original_torch_jit_load = torch.jit.load
-
-                def load_lama_on_cpu(*args, **kwargs):
-                    kwargs.setdefault("map_location", torch.device("cpu"))
-                    return original_torch_jit_load(*args, **kwargs)
-
-                try:
-                    torch.jit.load = load_lama_on_cpu
-                    simple_lama_model = SimpleLama(device=torch.device("cpu"))
-                finally:
-                    torch.jit.load = original_torch_jit_load
-
+                simple_lama_model = LamaModel()
                 print("LAMA model loaded.")
 
     return simple_lama_model
