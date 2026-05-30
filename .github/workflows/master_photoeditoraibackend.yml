@@ -10,6 +10,10 @@ on:
       - master
   workflow_dispatch:
 
+concurrency:
+  group: azure-webapp-photoeditoraibackend-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
