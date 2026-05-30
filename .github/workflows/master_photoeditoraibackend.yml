@@ -10,10 +10,6 @@ on:
       - master
   workflow_dispatch:
 
-concurrency:
-  group: azure-webapp-photoeditoraibackend-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -26,7 +22,7 @@ jobs:
       - name: Set up Python version
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.14'
 
       # 🛠️ Local Build Section (Optional)
       # The following section in your workflow is designed to catch build issues early on the client side, before deployment. This can be helpful for debugging and validation. However, if this step significantly increases deployment time and early detection is not critical for your workflow, you may remove this section to streamline the deployment process.
@@ -67,9 +63,9 @@ jobs:
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_89B5C185AC7D495FB0DD57559CE61E97 }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_F12DE5465260472590965F1A1D8D591F }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_80F3B5B87FCE4F37BC48489F4A2E964A }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_4F2BD1F3F1B348CB9D9CB681E2A2CD62 }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_A0200B2107554EE18C9B626A3D263622 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_C87C85585EA64844904EDEE847A3121F }}
 
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
