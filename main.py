@@ -2,26 +2,67 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter
 import base64
 import os
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 import io
 import re
-import numpy as np
-import cv2
-from simple_lama_inpainting import SimpleLama
-import rembg
+from threading import Lock
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 app = FastAPI()
 
 load_dotenv()
 
-print("Initializing AI models (this might take a few seconds)...")
-simple_lama_model = SimpleLama()
-rembg_session = rembg.new_session()
-print("AI models loaded successfully!")
+simple_lama_model = None
+simple_lama_lock = Lock()
+rembg_session = None
+rembg_lock = Lock()
+
+
+def get_simple_lama_model():
+    global simple_lama_model
+
+    if simple_lama_model is None:
+        with simple_lama_lock:
+            if simple_lama_model is None:
+                print("Loading LAMA model...")
+                import torch
+                from simple_lama_inpainting import SimpleLama
+
+                original_torch_jit_load = torch.jit.load
+
+                def load_lama_on_cpu(*args, **kwargs):
+                    kwargs.setdefault("map_location", torch.device("cpu"))
+                    return original_torch_jit_load(*args, **kwargs)
+
+                try:
+                    torch.jit.load = load_lama_on_cpu
+                    simple_lama_model = SimpleLama(device=torch.device("cpu"))
+                finally:
+                    torch.jit.load = original_torch_jit_load
+
+                print("LAMA model loaded.")
+
+    return simple_lama_model
+
+
+def get_rembg_session():
+    global rembg_session
+
+    if rembg_session is None:
+        with rembg_lock:
+            if rembg_session is None:
+                print("Loading rembg session...")
+                import rembg
+
+                rembg_session = rembg.new_session()
+                print("rembg session loaded.")
+
+    return rembg_session
 
 def get_openai_client() -> AsyncOpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -73,9 +114,9 @@ def process_lama(input_image_bytes: bytes, mask_bytes: bytes) -> bytes:
         new_w = max(1, int(orig_w * scale_factor))
         new_h = max(1, int(orig_h * scale_factor))
         
-        # Round up to nearest multiple of 8, LAMA often expects dimensions divisible by 8 or 16
-        new_w = new_w - (new_w % 8)
-        new_h = new_h - (new_h % 8)
+        # LAMA expects dimensions divisible by 8.
+        new_w = max(8, new_w - (new_w % 8))
+        new_h = max(8, new_h - (new_h % 8))
 
         img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
         mask_img = mask_img.resize((new_w, new_h), Image.Resampling.NEAREST)
@@ -84,13 +125,21 @@ def process_lama(input_image_bytes: bytes, mask_bytes: bytes) -> bytes:
     if mask_img.size != img.size:
         mask_img = mask_img.resize(img.size, Image.Resampling.NEAREST)
 
-    # Dilate mask slightly to cover object edges better 
-    mask_np = np.array(mask_img)
-    kernel = np.ones((5, 5), np.uint8)
-    mask_np = cv2.dilate(mask_np, kernel, iterations=2)
-    mask_img = Image.fromarray(mask_np)
+    # Dilate mask slightly to cover object edges better.
+    mask_img = mask_img.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MaxFilter(5))
 
-    result = simple_lama_model(img, mask_img)
+    processed_w, processed_h = img.size
+    pad_w = (-processed_w) % 8
+    pad_h = (-processed_h) % 8
+
+    if pad_w or pad_h:
+        img = ImageOps.expand(img, border=(0, 0, pad_w, pad_h), fill=(255, 255, 255))
+        mask_img = ImageOps.expand(mask_img, border=(0, 0, pad_w, pad_h), fill=0)
+
+    result = get_simple_lama_model()(img, mask_img)
+
+    if pad_w or pad_h:
+        result = result.crop((0, 0, processed_w, processed_h))
     
     if max_dim > 1024:
         result = result.resize((orig_w, orig_h), Image.Resampling.LANCZOS)
@@ -140,7 +189,9 @@ async def read_valid_image(file: UploadFile) -> bytes:
 
 
 def remove_image_background(input_bytes: bytes) -> bytes:
-    return rembg.remove(input_bytes, session=rembg_session)
+    import rembg
+
+    return rembg.remove(input_bytes, session=get_rembg_session())
 
 def open_image(input_bytes: bytes) -> Image.Image:
     try:
